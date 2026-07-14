@@ -1,0 +1,16 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(curl -s \"https://api.ipgeolocation.io/v3/ipgeo?apiKey=791813e96fa34c8a8a4d14f9816c0417&ip=8.8.8.8\")",
+      "Bash(make run *)",
+      "Bash(docker compose down *)",
+      "Bash(curl -s \"http://localhost:8080/api/geolocation?ip=91.128.103.196\")",
+      "Bash(curl *)",
+      "Bash(docker exec *)",
+      "Bash(docker compose *)",
+      "Bash(GEOLOCATION_API_KEY=791813e96fa34c8a8a4d14f9816c0417 docker compose up *)",
+      "Bash(python3 -m json.tool)",
+      "Bash(make curl-examples *)"
+    ]
+  }
+}
