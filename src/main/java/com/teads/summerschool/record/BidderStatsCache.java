@@ -136,15 +136,7 @@ public class BidderStatsCache {
                         budgetMap.put(creativeId, budget);
                     }
                     return budgetMap;
-                })
-                .onErrorReturn(t -> {
-                    log.warn("Redis MGET timeout, falling back to default budgets for {} creatives", creativeIds.size());
-                    return true;
-                }, creativeIds.stream()
-                        .collect(java.util.stream.Collectors.toMap(
-                                id -> id,
-                                id -> defaultBudget
-                        )));
+                });
     }
 
     public long getWinCount() {
