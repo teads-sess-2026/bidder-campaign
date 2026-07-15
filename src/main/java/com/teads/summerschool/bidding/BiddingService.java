@@ -134,37 +134,85 @@ public class BiddingService {
                         return bidRecordRepository.save(record).thenReturn(Optional.empty());
                     }
 
-//                    random creative selected, to be implemented
-                    CachedCreative selectedCached = cachedCreatives.get(random.nextInt(cachedCreatives.size()));
+                    // F3: Filter creatives by max bid price (checked BEFORE targeting and budget)
+                    List<CachedCreative> affordableCreatives = cachedCreatives.stream()
+                            .filter(c -> c.isWithinMaxBid(request.floorPrice()))
+                            .toList();
 
-                    double bidPrice = computeBidPrice(request);
+                    if (affordableCreatives.isEmpty()) {
+                        record.setNoBidReason("floor_exceeds_max_bid");
+                        record.setLatencyMs((int) ((System.nanoTime() - start) / 1_000_000));
+                        metrics.recordNoBid("floor_exceeds_max_bid");
+                        metrics.recordLatency(record.getLatencyMs());
+                        return bidRecordRepository.save(record).thenReturn(Optional.empty());
+                    }
 
-                    record.setCreativeId(selectedCached.id());
-                    record.setBidPrice(bidPrice);
-                    record.setLatencyMs((int) ((System.nanoTime() - start) / 1_000_000));
+                    // F1: Filter creatives by audience targeting (geo, device, audience_segment)
+                    List<CachedCreative> matchingCreatives = affordableCreatives.stream()
+                            .filter(c -> c.matches(
+                                    request.targeting().geo(),
+                                    request.targeting().deviceType(),
+                                    request.targeting().audienceSegment()))
+                            .toList();
 
-                    ownBidCache.record(request.requestId(), selectedCached.id(), bidPrice);
+                    if (matchingCreatives.isEmpty()) {
+                        record.setNoBidReason("targeting_miss");
+                        record.setLatencyMs((int) ((System.nanoTime() - start) / 1_000_000));
+                        metrics.recordNoBid("targeting_miss");
+                        metrics.recordLatency(record.getLatencyMs());
+                        return bidRecordRepository.save(record).thenReturn(Optional.empty());
+                    }
 
-                    metrics.recordLatency(record.getLatencyMs());
+                    // F2: Filter creatives by budget (must have remaining budget > 0) - batch fetch with MGET
+                    List<String> creativeIds = matchingCreatives.stream()
+                            .map(c -> c.id())
+                            .toList();
 
-                    // Fetch full Creative from DB for response fields (name, imageUrl, etc)
-                    return creativeCache.getAll()
-                            .filter(c -> c.getId().equals(selectedCached.id()))
-                            .next()
-                            .flatMap(fullCreative -> {
-                                BidResponse response = new BidResponse(
-                                        request.requestId(),
-                                        bidPrice,
-                                        toCreativeDto(fullCreative)
-                                );
-                                return bidRecordRepository.save(record).thenReturn(Optional.of(response));
-                            })
-                            .switchIfEmpty(Mono.defer(() -> {
-                                log.warn("Creative {} not found in DB after cache lookup", selectedCached.id());
-                                record.setNoBidReason("creative_not_found");
-                                metrics.recordNoBid("creative_not_found");
-                                return bidRecordRepository.save(record).thenReturn(Optional.empty());
-                            }));
+                    return statsCache.getRemainingBudgets(creativeIds)
+                            .map(budgetMap -> matchingCreatives.stream()
+                                    .filter(c -> budgetMap.getOrDefault(c.id(), 0.0) > 0)
+                                    .toList())
+                            .flatMap(eligibleCreatives -> {
+                                if (eligibleCreatives.isEmpty()) {
+                                    record.setNoBidReason("budget_exhausted");
+                                    record.setLatencyMs((int) ((System.nanoTime() - start) / 1_000_000));
+                                    metrics.recordNoBid("budget_exhausted");
+                                    metrics.recordLatency(record.getLatencyMs());
+                                    return bidRecordRepository.save(record).thenReturn(Optional.empty());
+                                }
+
+                                // Select random creative from eligible ones
+                                CachedCreative selectedCached = eligibleCreatives.get(random.nextInt(eligibleCreatives.size()));
+
+                                double bidPrice = computeBidPrice(request);
+
+                                record.setCreativeId(selectedCached.id());
+                                record.setBidPrice(bidPrice);
+                                record.setLatencyMs((int) ((System.nanoTime() - start) / 1_000_000));
+
+                                ownBidCache.record(request.requestId(), selectedCached.id(), bidPrice);
+
+                                metrics.recordLatency(record.getLatencyMs());
+
+                                // Fetch full Creative from DB for response fields (name, imageUrl, etc)
+                                return creativeCache.getAll()
+                                        .filter(c -> c.getId().equals(selectedCached.id()))
+                                        .next()
+                                        .flatMap(fullCreative -> {
+                                            BidResponse response = new BidResponse(
+                                                    request.requestId(),
+                                                    bidPrice,
+                                                    toCreativeDto(fullCreative)
+                                            );
+                                            return bidRecordRepository.save(record).thenReturn(Optional.of(response));
+                                        })
+                                        .switchIfEmpty(Mono.defer(() -> {
+                                            log.warn("Creative {} not found in DB after cache lookup", selectedCached.id());
+                                            record.setNoBidReason("creative_not_found");
+                                            metrics.recordNoBid("creative_not_found");
+                                            return bidRecordRepository.save(record).thenReturn(Optional.empty());
+                                        }));
+                            });
                 });
     }
 

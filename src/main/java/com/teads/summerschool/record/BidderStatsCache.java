@@ -106,6 +106,38 @@ public class BidderStatsCache {
                         .thenReturn(defaultBudget));
     }
 
+    /** Batch fetch remaining budgets for multiple creatives using MGET. Returns Map<creativeId, budget>. */
+    public Mono<java.util.Map<String, Double>> getRemainingBudgets(List<String> creativeIds) {
+        if (creativeIds.isEmpty()) {
+            return Mono.just(java.util.Map.of());
+        }
+
+        List<String> keys = creativeIds.stream()
+                .map(this::budgetKey)
+                .toList();
+
+        double defaultBudget = properties.getCreativeBudget();
+
+        return redis.opsForValue().multiGet(keys)
+                .map(values -> {
+                    java.util.Map<String, Double> budgetMap = new java.util.HashMap<>();
+                    for (int i = 0; i < creativeIds.size(); i++) {
+                        String creativeId = creativeIds.get(i);
+                        String value = values != null && i < values.size() ? values.get(i) : null;
+                        double budget = defaultBudget;
+                        if (value != null) {
+                            try {
+                                budget = Double.parseDouble(value);
+                            } catch (NumberFormatException e) {
+                                budget = defaultBudget;
+                            }
+                        }
+                        budgetMap.put(creativeId, budget);
+                    }
+                    return budgetMap;
+                });
+    }
+
     public long getWinCount() {
         return winCount.get();
     }
