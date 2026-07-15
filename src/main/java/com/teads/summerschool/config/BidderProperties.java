@@ -14,6 +14,7 @@ public class BidderProperties {
     private long timeoutMs = 1000;
     private Strategy strategy = new Strategy();
     private Competition competition = new Competition();
+    private AdaptiveStrategy adaptiveStrategy = new AdaptiveStrategy();
 
     public String getId() { return id; }
     public void setId(String id) { this.id = id; }
@@ -32,6 +33,9 @@ public class BidderProperties {
 
     public Competition getCompetition() { return competition; }
     public void setCompetition(Competition competition) { this.competition = competition; }
+
+    public AdaptiveStrategy getAdaptiveStrategy() { return adaptiveStrategy; }
+    public void setAdaptiveStrategy(AdaptiveStrategy adaptiveStrategy) { this.adaptiveStrategy = adaptiveStrategy; }
 
     public static class Strategy {
         private int minSamples = 10;
@@ -74,5 +78,36 @@ public class BidderProperties {
 
         public long getDurationSeconds() { return durationSeconds; }
         public void setDurationSeconds(long durationSeconds) { this.durationSeconds = durationSeconds; }
+    }
+
+    /**
+     * Adaptive bidding strategy configuration.
+     * Simple and minimal: 6 parameters, each with clear purpose.
+     */
+    public static class AdaptiveStrategy {
+        private boolean enabled = false;           // Feature flag (off by default)
+        private double learningRate = 0.05;        // Fixed 5% adjustment per update
+        private int minSamples = 20;               // Wait for data before adapting
+        private double efficiencyThreshold = 0.90; // Target 90%+ efficiency (clearing/bid)
+        private double maxWeightShift = 0.05;      // Cap adjustments at 5% per update
+        private double explorationNoise = 0.05;    // Random factor ±5%
+
+        public boolean isEnabled() { return enabled; }
+        public void setEnabled(boolean enabled) { this.enabled = enabled; }
+
+        public double getLearningRate() { return learningRate; }
+        public void setLearningRate(double learningRate) { this.learningRate = learningRate; }
+
+        public int getMinSamples() { return minSamples; }
+        public void setMinSamples(int minSamples) { this.minSamples = minSamples; }
+
+        public double getEfficiencyThreshold() { return efficiencyThreshold; }
+        public void setEfficiencyThreshold(double efficiencyThreshold) { this.efficiencyThreshold = efficiencyThreshold; }
+
+        public double getMaxWeightShift() { return maxWeightShift; }
+        public void setMaxWeightShift(double maxWeightShift) { this.maxWeightShift = maxWeightShift; }
+
+        public double getExplorationNoise() { return explorationNoise; }
+        public void setExplorationNoise(double explorationNoise) { this.explorationNoise = explorationNoise; }
     }
 }
