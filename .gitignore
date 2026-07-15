@@ -32,5 +32,8 @@ build/
 ### VS Code ###
 .vscode/
 
-# Prod-mode secrets (DB password for the AWS backing services)
+# Environment files with secrets
 config.prod.env
+config.env
+*.env
+!*.env.example
