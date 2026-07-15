@@ -18,7 +18,7 @@ import java.util.concurrent.TimeUnit;
 public class BidderMetrics {
 
     private final MeterRegistry registry;
-    public final Counter requests;
+    private final Counter requests;
     private final Counter bids;
     private final Counter wins;
     private final Counter losses;
@@ -47,7 +47,7 @@ public class BidderMetrics {
                 .description("Total clearing price paid").register(registry);
         this.bidLatency = Timer.builder(prefix + "bid.latency")
                 .description("Bid handling latency").register(registry);
-        this.summerschool_bids = Counter.builder(prefix + "summerschool_bids")
+        this.summerschool_bids = Counter.builder(prefix + "Summerschool bids")
                 .description("Summerschool bids").register(registry);
     }
 
