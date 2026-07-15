@@ -4,6 +4,7 @@ import com.teads.summerschool.bidding.dto.BidRequest;
 import com.teads.summerschool.bidding.dto.BidResponse;
 import com.teads.summerschool.bidding.dto.CreativeDto;
 import com.teads.summerschool.config.BidderProperties;
+import com.teads.summerschool.creative.CachedCreative;
 import com.teads.summerschool.creative.Creative;
 import com.teads.summerschool.creative.CreativeCache;
 import com.teads.summerschool.geolocation.GeolocationService;
@@ -93,6 +94,8 @@ public class BiddingService {
     }
 
     public Mono<Optional<BidResponse>> bid(BidRequest request) {
+        long start = System.nanoTime();
+        metrics.summerschool_bids.increment();
         // TODO: implement your bidding strategy
         // Hints:
         //   1. Record the request with buildRecord(request)
@@ -118,13 +121,51 @@ public class BiddingService {
         // }
 
         metrics.recordRequest();
-        metrics.recordNoBid("not_implemented");
         BidRecord record = buildRecord(request);
-        record.setNoBidReason("not_implemented");
-        long start = System.nanoTime();
-        record.setLatencyMs((int) ((System.nanoTime() - start) / 1_000_000));
-        metrics.recordLatency(0);
-        return bidRecordRepository.save(record).thenReturn(Optional.empty());
+
+        return creativeCache.getAllCached()
+                .collectList()
+                .flatMap(cachedCreatives -> {
+                    if (cachedCreatives.isEmpty()) {
+                        record.setNoBidReason("no_eligible_creative");
+                        record.setLatencyMs((int) ((System.nanoTime() - start) / 1_000_000));
+                        metrics.recordNoBid("no_eligible_creative");
+                        metrics.recordLatency(record.getLatencyMs());
+                        return bidRecordRepository.save(record).thenReturn(Optional.empty());
+                    }
+
+//                    random creative selected, to be implemented
+                    CachedCreative selectedCached = cachedCreatives.get(random.nextInt(cachedCreatives.size()));
+
+                    double bidPrice = computeBidPrice(request);
+
+                    record.setCreativeId(selectedCached.id());
+                    record.setBidPrice(bidPrice);
+                    record.setLatencyMs((int) ((System.nanoTime() - start) / 1_000_000));
+
+                    ownBidCache.record(request.requestId(), selectedCached.id(), bidPrice);
+
+                    metrics.recordLatency(record.getLatencyMs());
+
+                    // Fetch full Creative from DB for response fields (name, imageUrl, etc)
+                    return creativeCache.getAll()
+                            .filter(c -> c.getId().equals(selectedCached.id()))
+                            .next()
+                            .flatMap(fullCreative -> {
+                                BidResponse response = new BidResponse(
+                                        request.requestId(),
+                                        bidPrice,
+                                        toCreativeDto(fullCreative)
+                                );
+                                return bidRecordRepository.save(record).thenReturn(Optional.of(response));
+                            })
+                            .switchIfEmpty(Mono.defer(() -> {
+                                log.warn("Creative {} not found in DB after cache lookup", selectedCached.id());
+                                record.setNoBidReason("creative_not_found");
+                                metrics.recordNoBid("creative_not_found");
+                                return bidRecordRepository.save(record).thenReturn(Optional.empty());
+                            }));
+                });
     }
 
     private double computeBidPrice(BidRequest request) {
@@ -136,19 +177,26 @@ public class BiddingService {
 
     /** Total remaining budget across all this bidder's creatives. */
     public Mono<Double> getRemainingBudget() {
-        return creativeCache.getAll()
-                .flatMap(c -> statsCache.getRemainingBudget(c.getId()))
+        return creativeCache.getAllCached()
+                .flatMap(c -> statsCache.getRemainingBudget(c.id()))
                 .reduce(0.0, Double::sum);
     }
 
     /** Remaining budget per creative id. */
     public Mono<Map<String, Double>> getRemainingBudgets() {
-        return creativeCache.getAll()
-                .flatMap(c -> statsCache.getRemainingBudget(c.getId()).map(budget -> Map.entry(c.getId(), budget)))
+        return creativeCache.getAllCached()
+                .flatMap(c -> statsCache.getRemainingBudget(c.id()).map(budget -> Map.entry(c.id(), budget)))
                 .collectMap(Map.Entry::getKey, Map.Entry::getValue, LinkedHashMap::new);
     }
 
     private Flux<Creative> matchingCreatives(BidRequest request, Flux<Creative> all) {
+        return all.filter(c -> c.matches(
+                        request.targeting().geo(),
+                        request.targeting().deviceType(),
+                        request.targeting().audienceSegment()));
+    }
+
+    private Flux<CachedCreative> matchingCachedCreatives(BidRequest request, Flux<CachedCreative> all) {
         return all.filter(c -> c.matches(
                         request.targeting().geo(),
                         request.targeting().deviceType(),
