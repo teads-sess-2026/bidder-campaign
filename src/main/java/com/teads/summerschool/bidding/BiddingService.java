@@ -12,6 +12,7 @@ import com.teads.summerschool.record.BidRecord;
 import com.teads.summerschool.record.BidRecordRepository;
 import com.teads.summerschool.record.BidderStatsCache;
 import com.teads.summerschool.record.OwnBidCache;
+import io.micrometer.core.instrument.Counter;
 import jakarta.annotation.PostConstruct;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -93,6 +94,7 @@ public class BiddingService {
     }
 
     public Mono<Optional<BidResponse>> bid(BidRequest request) {
+        metrics.summerschool_bids.increment();
         // TODO: implement your bidding strategy
         // Hints:
         //   1. Record the request with buildRecord(request)

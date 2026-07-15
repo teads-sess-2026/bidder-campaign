@@ -36,6 +36,9 @@ public class AuctionNoticeConsumer {
     @KafkaListener(topics = "${kafka.topic.auction-notifications}",
             autoStartup = "${spring.kafka.listener.auto-startup:true}")
     public void consume(byte[] message) {
-        // TODO: parse the auction notice and handle wins/losses
+        try {
+            AuctionNoticeProto.AuctionNotice notice = AuctionNoticeProto.AuctionNotice.parseFrom(message);
+
+        }
     }
 }
