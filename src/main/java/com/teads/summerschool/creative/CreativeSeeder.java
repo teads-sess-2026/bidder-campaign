@@ -71,7 +71,7 @@ public class CreativeSeeder implements ApplicationRunner {
     }
 
     private String pickSubset(String[] options, Random rnd) {
-        if (rnd.nextDouble() < 0.3) return "";
+        if (rnd.nextDouble() < 0.6) return "";
         int n = 1 + rnd.nextInt(options.length);
         List<String> pool = new ArrayList<>(List.of(options));
         Collections.shuffle(pool, rnd);

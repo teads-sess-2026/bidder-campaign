@@ -58,6 +58,20 @@ public record CachedCreative(
                 && matchesField(allowedDevices, deviceType);
     }
 
+    public int specificityScore() {
+        int score = 0;
+        score += fieldSpecificity(allowedGeos);
+        score += fieldSpecificity(allowedDevices);
+        score += fieldSpecificity(audienceSegments);
+        return score;
+    }
+
+    private int fieldSpecificity(String field) {
+        if (field == null || field.isBlank()) return 0;
+        int entries = field.split(",").length;
+        return 10 - Math.min(9, entries);
+    }
+
     private boolean matchesField(String allowed, String value) {
         // Creative accepts any value (no restriction)
         if (allowed == null || allowed.isBlank()) return true;

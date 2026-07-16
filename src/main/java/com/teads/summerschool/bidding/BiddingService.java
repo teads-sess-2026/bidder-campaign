@@ -127,24 +127,12 @@ public class BiddingService {
                     }
 
                     // F1: audience targeting (all three dimensions must pass)
-                    List<CachedCreative> strictMatches = affordableCreatives.stream()
+                    List<CachedCreative> matchingCreatives = affordableCreatives.stream()
                             .filter(c -> c.matches(
                                     request.targeting().geo(),
                                     request.targeting().deviceType(),
                                     request.targeting().audienceSegment()))
                             .toList();
-
-                    final List<CachedCreative> matchingCreatives;
-                    if (strictMatches.isEmpty()) {
-                        List<CachedCreative> fallbackMatches = affordableCreatives.stream()
-                                .filter(c -> c.matchesGeoAndDevice(
-                                        request.targeting().geo(),
-                                        request.targeting().deviceType()))
-                                .toList();
-                        matchingCreatives = fallbackMatches.isEmpty() ? List.of() : fallbackMatches;
-                    } else {
-                        matchingCreatives = strictMatches;
-                    }
 
                     if (matchingCreatives.isEmpty()) {
                         return noBid(record, start, "targeting_miss");
@@ -172,8 +160,17 @@ public class BiddingService {
                                     return noBid(record, start, "pacing");
                                 }
 
+                                // Specificity-first: prefer narrow-targeted creatives,
+                                // reserve broad catch-alls for auctions with no specific match
+                                int maxSpecificity = eligibleCreatives.stream()
+                                        .mapToInt(CachedCreative::specificityScore)
+                                        .max().orElse(0);
+                                List<CachedCreative> topTier = eligibleCreatives.stream()
+                                        .filter(c -> c.specificityScore() >= maxSpecificity - 3)
+                                        .toList();
+
                                 CachedCreative selectedCached = selectCreativeByBudgetWeight(
-                                        eligibleCreatives,
+                                        topTier.isEmpty() ? eligibleCreatives : topTier,
                                         budgetMap,
                                         properties.getStrategy().isWeightedSelectionEnabled()
                                 );
