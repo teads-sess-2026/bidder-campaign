@@ -160,20 +160,8 @@ public class BiddingService {
                                     return noBid(record, start, "pacing");
                                 }
 
-                                // Specificity-first: prefer narrow-targeted creatives,
-                                // reserve broad catch-alls for auctions with no specific match
-                                int maxSpecificity = eligibleCreatives.stream()
-                                        .mapToInt(CachedCreative::specificityScore)
-                                        .max().orElse(0);
-                                List<CachedCreative> topTier = eligibleCreatives.stream()
-                                        .filter(c -> c.specificityScore() >= maxSpecificity - 3)
-                                        .toList();
-
-                                CachedCreative selectedCached = selectCreativeByBudgetWeight(
-                                        topTier.isEmpty() ? eligibleCreatives : topTier,
-                                        budgetMap,
-                                        properties.getStrategy().isWeightedSelectionEnabled()
-                                );
+                                CachedCreative selectedCached = selectCreativeBySpecificityAndBudget(
+                                        eligibleCreatives, budgetMap);
 
                                 double bidPrice = computeBidPrice(request);
 
@@ -405,6 +393,48 @@ public class BiddingService {
         }
 
         // Fallback (rounding edge case)
+        return eligibleCreatives.get(eligibleCreatives.size() - 1);
+    }
+
+    /**
+     * Combined specificity + budget weighted selection.
+     * Specificity acts as a multiplier on budget weight: narrow-targeted creatives
+     * are favored but not exclusively picked, spreading load across the portfolio.
+     */
+    private CachedCreative selectCreativeBySpecificityAndBudget(
+            List<CachedCreative> eligibleCreatives,
+            java.util.Map<String, Double> budgetMap) {
+
+        if (eligibleCreatives.size() == 1) {
+            return eligibleCreatives.get(0);
+        }
+
+        // Combined weight = budget × (1 + specificityScore)
+        // Specificity 0 (broad) → multiplier 1x
+        // Specificity 27 (max narrow) → multiplier 28x
+        double totalWeight = 0.0;
+        for (CachedCreative creative : eligibleCreatives) {
+            double budget = budgetMap.getOrDefault(creative.id(), 0.0);
+            double specificity = 1.0 + creative.specificityScore();
+            totalWeight += budget * specificity;
+        }
+
+        if (totalWeight <= 0.0) {
+            return eligibleCreatives.get(random.nextInt(eligibleCreatives.size()));
+        }
+
+        double randomValue = random.nextDouble() * totalWeight;
+        double cumulative = 0.0;
+
+        for (CachedCreative creative : eligibleCreatives) {
+            double budget = budgetMap.getOrDefault(creative.id(), 0.0);
+            double specificity = 1.0 + creative.specificityScore();
+            cumulative += budget * specificity;
+            if (randomValue <= cumulative) {
+                return creative;
+            }
+        }
+
         return eligibleCreatives.get(eligibleCreatives.size() - 1);
     }
 }
