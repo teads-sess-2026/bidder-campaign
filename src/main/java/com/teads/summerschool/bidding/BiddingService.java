@@ -42,6 +42,7 @@ public class BiddingService {
     private final BidderMetrics metrics;
     private final OwnBidCache ownBidCache;
     private final GeolocationService geolocationService;
+    private final AdaptiveWeightsCache weightsCache;
 
     // Last successfully computed budget.remaining, served when a scrape's
     // computation times out instead of blocking the scrape thread forever.
@@ -53,7 +54,8 @@ public class BiddingService {
                           BidderStatsCache statsCache,
                           BidderMetrics metrics,
                           OwnBidCache ownBidCache,
-                          GeolocationService geolocationService) {
+                          GeolocationService geolocationService,
+                          AdaptiveWeightsCache weightsCache) {
         this.properties = properties;
         this.creativeCache = creativeCache;
         this.bidRecordRepository = bidRecordRepository;
@@ -61,6 +63,7 @@ public class BiddingService {
         this.metrics = metrics;
         this.ownBidCache = ownBidCache;
         this.geolocationService = geolocationService;
+        this.weightsCache = weightsCache;
     }
 
     @PostConstruct
@@ -184,13 +187,23 @@ public class BiddingService {
                                 // Select random creative from eligible ones
                                 CachedCreative selectedCached = eligibleCreatives.get(random.nextInt(eligibleCreatives.size()));
 
-                                double bidPrice = computeBidPrice(request);
+                                double computedBidPrice = computeBidPrice(request);
+
+                                // Cap bid at creative's maxBidPrice (if set)
+                                final double bidPrice;
+                                if (selectedCached.maxBidPrice() != null && computedBidPrice > selectedCached.maxBidPrice()) {
+                                    bidPrice = selectedCached.maxBidPrice();
+                                    log.debug("Capped bid to creative maxBidPrice: {}", bidPrice);
+                                } else {
+                                    bidPrice = computedBidPrice;
+                                }
 
                                 record.setCreativeId(selectedCached.id());
                                 record.setBidPrice(bidPrice);
                                 record.setLatencyMs((int) ((System.nanoTime() - start) / 1_000_000));
 
-                                ownBidCache.record(request.requestId(), selectedCached.id(), bidPrice);
+                                ownBidCache.record(request.requestId(), selectedCached.id(), bidPrice,
+                                                   BidSegment.from(request));
 
                                 metrics.recordLatency(record.getLatencyMs());
 
@@ -217,10 +230,30 @@ public class BiddingService {
     }
 
     private double computeBidPrice(BidRequest request) {
-        // TODO: implement your pricing strategy
-        // The bid must be above request.floorPrice().
-        // Use properties.getStrategy() for tuning parameters.
-        return request.floorPrice() * 1.01;
+        // Static fallback if adaptive disabled
+        if (!properties.getAdaptiveStrategy().isEnabled()) {
+            return request.floorPrice() * 1.01;
+        }
+
+        // Adaptive weight-based pricing (100ms SLA: pure in-memory, <0.01ms)
+        BidSegment segment = BidSegment.from(request);
+        AdaptiveWeights weights = weightsCache.getWeightsSync(segment);
+
+        double floor = request.floorPrice();
+        double market = Math.max(statsCache.getRollingAverageWinPrice(), floor);
+
+        // Random exploration with gaussian noise (prevents local optima)
+        double randomFactor = 1.0 + random.nextGaussian() *
+            properties.getAdaptiveStrategy().getExplorationNoise();
+        double randomComponent = floor * Math.max(0.95, Math.min(1.05, randomFactor));
+
+        // Weighted combination
+        double bid = weights.floorWeight() * floor +
+                     weights.marketWeight() * market +
+                     weights.randomWeight() * randomComponent;
+
+        // Safety: never below floor * 1.001 (must beat floor price)
+        return Math.max(floor * 1.001, bid);
     }
 
     /** Total remaining budget across all this bidder's creatives. */

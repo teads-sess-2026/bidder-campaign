@@ -20,17 +20,26 @@ public class AuctionNoticeConsumer {
     private final BidderStatsCache statsCache;
     private final BidderMetrics metrics;
     private final OwnBidCache ownBidCache;
+    private final com.teads.summerschool.bidding.SegmentStatsCache segmentStatsCache;
+    private final com.teads.summerschool.bidding.AdaptiveWeightsCache weightsCache;
+    private final com.teads.summerschool.bidding.WeightAdjuster weightAdjuster;
 
     public AuctionNoticeConsumer(WinNoticeRepository winNoticeRepository,
                                  BidderProperties properties,
                                  BidderStatsCache statsCache,
                                  BidderMetrics metrics,
-                                 OwnBidCache ownBidCache) {
+                                 OwnBidCache ownBidCache,
+                                 com.teads.summerschool.bidding.SegmentStatsCache segmentStatsCache,
+                                 com.teads.summerschool.bidding.AdaptiveWeightsCache weightsCache,
+                                 com.teads.summerschool.bidding.WeightAdjuster weightAdjuster) {
         this.winNoticeRepository = winNoticeRepository;
         this.properties = properties;
         this.statsCache = statsCache;
         this.metrics = metrics;
         this.ownBidCache = ownBidCache;
+        this.segmentStatsCache = segmentStatsCache;
+        this.weightsCache = weightsCache;
+        this.weightAdjuster = weightAdjuster;
     }
 
     @KafkaListener(topics = "${kafka.topic.auction-notifications}",
@@ -59,13 +68,15 @@ public class AuctionNoticeConsumer {
                     ourBid.bidPrice()
                 );
 
-
                 winNoticeRepository.save(winNotice)
                     .doOnSuccess(saved -> log.info("WIN id={} creative={} clearing={} bid={} saved",
                         notice.getRequestId(), ourBid.creativeId(), notice.getClearingPrice(), ourBid.bidPrice()))
                     .doOnError(error -> log.error("Failed to save win notice for id={}: {}",
                         notice.getRequestId(), error.getMessage()))
                     .subscribe();
+
+                // Adaptive weight adjustment (async, not in bid path)
+                adjustWeights(ourBid, true, notice.getClearingPrice());
             }else{
                 if(ourBid!=null){
                     metrics.recordLoss();
@@ -73,10 +84,52 @@ public class AuctionNoticeConsumer {
                     log.info("LOSS id={} creative={} ourBid={} clearing={} gap={} winner={}",
                         notice.getRequestId(), ourBid.creativeId(), ourBid.bidPrice(),
                         notice.getClearingPrice(), gap, notice.getWinningBidderId());
+
+                    // Adaptive weight adjustment (async, not in bid path)
+                    adjustWeights(ourBid, false, notice.getClearingPrice());
                 }
             }
         }catch (Exception e){
             log.error("** KAFKA ERROR failed to process auction notice: {}", e.getMessage());
+        }
+    }
+
+    /**
+     * Adjust adaptive weights based on auction outcome.
+     * Runs async (not in bid path), so safe to use synchronous weight lookups.
+     */
+    private void adjustWeights(OwnBidCache.Entry ourBid, boolean won, double clearingPrice) {
+        if (!properties.getAdaptiveStrategy().isEnabled()) {
+            return;
+        }
+
+        try {
+            com.teads.summerschool.bidding.BidSegment segment = ourBid.segment();
+
+            // Record outcome
+            segmentStatsCache.recordOutcome(segment, won, clearingPrice);
+
+            // Get stats
+            com.teads.summerschool.bidding.SegmentStats stats = segmentStatsCache.getStats(segment);
+
+            // Wait for minimum samples before adjusting
+            if (stats.getAuctionCount() < properties.getAdaptiveStrategy().getMinSamples()) {
+                log.debug("Segment {} has only {} auctions, waiting for {} before adjusting",
+                    segment, stats.getAuctionCount(), properties.getAdaptiveStrategy().getMinSamples());
+                return;
+            }
+
+            // Get current weights and adjust
+            com.teads.summerschool.bidding.AdaptiveWeights currentWeights = weightsCache.getWeightsSync(segment);
+            com.teads.summerschool.bidding.AdaptiveWeights newWeights = weightAdjuster.adjust(
+                segment, won, ourBid.bidPrice(), clearingPrice, currentWeights, stats
+            );
+
+            // Update cache
+            weightsCache.updateWeightsSync(segment, newWeights);
+
+        } catch (Exception e) {
+            log.error("Failed to adjust weights: {}", e.getMessage(), e);
         }
     }
 }

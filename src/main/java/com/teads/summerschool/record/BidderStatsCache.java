@@ -32,12 +32,12 @@ public class BidderStatsCache {
     // ARGV[2] = clearing price to subtract. Atomic on the Redis server itself, replacing the old
     // synchronized setIfAbsent()-then-increment() pair, which only ever guarded against
     // concurrent callers within this one JVM, not against Redis itself.
-    private static final RedisScript<Double> RECORD_WIN_SCRIPT = RedisScript.of("""
+    private static final RedisScript<String> RECORD_WIN_SCRIPT = RedisScript.of("""
             if redis.call('EXISTS', KEYS[1]) == 0 then
                 redis.call('SET', KEYS[1], ARGV[1])
             end
             return redis.call('INCRBYFLOAT', KEYS[1], -tonumber(ARGV[2]))
-            """, Double.class);
+            """, String.class);
 
     private final BidderProperties properties;
     private final ReactiveRedisTemplate<String, String> redis;
@@ -72,6 +72,7 @@ public class BidderStatsCache {
                         List.of(key),
                         List.of(String.valueOf(properties.getCreativeBudget()), String.valueOf(clearingPrice)))
                 .next()
+                .map(result -> Double.parseDouble(result))
                 .doOnNext(after -> log.info("BUDGET  key={} clearing={} remaining={}", key, clearingPrice, after))
                 .flatMap(after -> creativeRepository.findById(creativeId)
                         .flatMap(c -> {

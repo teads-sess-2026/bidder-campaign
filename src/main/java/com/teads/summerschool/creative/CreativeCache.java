@@ -32,6 +32,9 @@ public class CreativeCache {
     private final BidderProperties properties;
     private final ReactiveRedisTemplate<String, String> redisTemplate;
 
+    // In-memory cache to avoid Redis roundtrip on every bid
+    private volatile java.util.List<CachedCreative> memoryCache = null;
+
     public CreativeCache(CreativeRepository repository, BidderProperties properties,
                          ReactiveRedisTemplate<String, String> redisTemplate) {
         this.repository = repository;
@@ -70,25 +73,24 @@ public class CreativeCache {
     }
 
     /**
-     * Fetch all creatives for bidding with Redis caching.
+     * Fetch all creatives for bidding with in-memory caching.
      * Returns CachedCreative (lightweight DTO with only bidding fields).
-     * HGETALL fetches all creatives atomically. Falls back to DB on cache miss or error.
+     * Uses in-memory cache to avoid Redis roundtrip on every bid.
      */
     public Flux<CachedCreative> getAllCached() {
-        return redisTemplate.opsForHash()
-                .values(creativeHashKey())
-                .map(obj -> deserialize((String) obj))
+        if (memoryCache != null) {
+            return Flux.fromIterable(memoryCache);
+        }
+
+        // Memory cache miss - load from DB and cache in memory
+        return repository.findByBidderId(properties.getId())
+                .map(CachedCreative::fromCreative)
                 .collectList()
-                .flatMapMany(cached -> {
-                    if (cached.isEmpty()) {
-                        return loadFromDatabaseAndCache();
-                    }
-                    return Flux.fromIterable(cached);
+                .doOnNext(creatives -> {
+                    memoryCache = creatives;
+                    log.info("Loaded {} creatives into memory cache", creatives.size());
                 })
-                .onErrorResume(e -> {
-                    log.error("Redis error, falling back to DB", e);
-                    return loadFromDatabaseDirectly();
-                });
+                .flatMapMany(Flux::fromIterable);
     }
 
     /** Load creatives from DB and populate Redis hash */
@@ -121,6 +123,7 @@ public class CreativeCache {
 
     /** Invalidate the entire creative cache for this bidder */
     public Mono<Void> invalidate() {
+        memoryCache = null;
         return redisTemplate.delete(creativeHashKey())
                 .then()
                 .doOnSuccess(v -> log.info("Creative cache invalidated"));
@@ -128,6 +131,7 @@ public class CreativeCache {
 
     /** Kept for CreativeSeeder, which logs the catalog size right after seeding. */
     public Mono<Void> refresh() {
+        memoryCache = null;
         return invalidate()
                 .then(loadFromDatabaseAndCache().count())
                 .doOnNext(n -> log.info("Creative catalog seeded: {} creatives", n))
