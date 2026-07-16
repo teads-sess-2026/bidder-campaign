@@ -151,12 +151,34 @@ public class BiddingService {
                     }
 
                     // F1: Filter creatives by audience targeting (geo, device, audience_segment)
-                    List<CachedCreative> matchingCreatives = affordableCreatives.stream()
+                    // Try strict matching first (all three dimensions)
+                    List<CachedCreative> strictMatches = affordableCreatives.stream()
                             .filter(c -> c.matches(
                                     request.targeting().geo(),
                                     request.targeting().deviceType(),
                                     request.targeting().audienceSegment()))
                             .toList();
+
+                    // Fallback: if no strict matches, relax audience_segment requirement
+                    // (geo and device still must match - they're critical for format/region)
+                    final List<CachedCreative> matchingCreatives;
+                    if (strictMatches.isEmpty()) {
+                        List<CachedCreative> fallbackMatches = affordableCreatives.stream()
+                                .filter(c -> c.matchesGeoAndDevice(
+                                        request.targeting().geo(),
+                                        request.targeting().deviceType()))
+                                .toList();
+
+                        if (!fallbackMatches.isEmpty()) {
+                            log.debug("Fallback to geo+device match (ignoring audience_segment) for request {}",
+                                    request.requestId());
+                            matchingCreatives = fallbackMatches;
+                        } else {
+                            matchingCreatives = List.of();
+                        }
+                    } else {
+                        matchingCreatives = strictMatches;
+                    }
 
                     if (matchingCreatives.isEmpty()) {
                         record.setNoBidReason("targeting_miss");

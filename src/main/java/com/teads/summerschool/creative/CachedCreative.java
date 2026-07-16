@@ -41,11 +41,21 @@ public record CachedCreative(
 
     /**
      * Check if this creative matches the given targeting criteria.
+     * Requires ALL three dimensions to match (strict matching).
      */
     public boolean matches(String geo, String deviceType, String audienceSegment) {
         return matchesField(allowedGeos, geo)
                 && matchesField(allowedDevices, deviceType)
                 && matchesField(audienceSegments, audienceSegment);
+    }
+
+    /**
+     * Partial match: geo and device MUST match, but audience segment is optional.
+     * Use as fallback when strict matching yields no results.
+     */
+    public boolean matchesGeoAndDevice(String geo, String deviceType) {
+        return matchesField(allowedGeos, geo)
+                && matchesField(allowedDevices, deviceType);
     }
 
     private boolean matchesField(String allowed, String value) {
