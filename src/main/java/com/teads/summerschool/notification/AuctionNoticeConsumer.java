@@ -53,12 +53,11 @@ public class AuctionNoticeConsumer {
             log.info("KAFKA id={} winner={} won={}", notice.getRequestId(), notice.getWinningBidderId(), won);
             if(won){
                 if(ourBid==null){
-                    log.warn("WIN but no matching bid record found for request_id={} - skipping budget update",
+                    log.warn("WIN but no matching bid record found for request_id={} - skipping win stats update",
                         notice.getRequestId());
                     return;
                 }
 
-                statsCache.recordWin(ourBid.creativeId(), notice.getClearingPrice()).subscribe();
                 metrics.recordWin(notice.getClearingPrice());
 
                 WinNotice winNotice = new WinNotice(
