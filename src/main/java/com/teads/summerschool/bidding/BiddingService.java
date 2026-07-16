@@ -21,7 +21,9 @@ import reactor.core.publisher.Flux;
 import reactor.core.publisher.Mono;
 
 import java.time.Duration;
+import java.time.Instant;
 import java.util.Arrays;
+import java.util.HashMap;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
@@ -44,9 +46,14 @@ public class BiddingService {
     private final GeolocationService geolocationService;
     private final AdaptiveWeightsCache weightsCache;
 
-    // Last successfully computed budget.remaining, served when a scrape's
-    // computation times out instead of blocking the scrape thread forever.
-    private volatile double lastKnownBudget = 0.0;
+    private double lastKnownBudget = 0.0;
+
+    // Pacing state
+    private Instant firstBidTime = null;
+    private double initialBudget = -1;
+
+    // In-memory creative DTO cache to avoid DB round-trip per bid
+    private Map<String, CreativeDto> creativeDtoCache = new HashMap<>();
 
     public BiddingService(BidderProperties properties,
                           CreativeCache creativeCache,
@@ -67,8 +74,9 @@ public class BiddingService {
     }
 
     @PostConstruct
-    void registerBudgetGauge() {
+    void init() {
         metrics.registerGauge("budget.remaining", this::getRemainingBudgetSafe);
+        warmCreativeDtoCache();
     }
 
     /**
@@ -99,30 +107,6 @@ public class BiddingService {
     public Mono<Optional<BidResponse>> bid(BidRequest request) {
         long start = System.nanoTime();
         metrics.summerschool_bids.increment();
-        // TODO: implement your bidding strategy
-        // Hints:
-        //   1. Record the request with buildRecord(request)
-        //   2. Find matching creatives with matchingCreatives(request, creativeCache.getAll())
-        //   3. Filter creatives whose maxBidPrice covers this floor: c.isWithinMaxBid(request.floorPrice())
-        //   4. Filter creatives that still have budget: statsCache.getRemainingBudget(c.getId()) > 0
-        //      (returns a Mono<Double> — flatMap/filterWhen into it)
-        //   5. Compute a bid price with computeBidPrice(request)
-        //   6. Record metrics: metrics.recordRequest(), metrics.recordBid(), metrics.recordNoBid(reason)
-        //   7. Call ownBidCache.record(requestId, creativeId, bidPrice) so AuctionNoticeConsumer
-        //      can look this bid up without a DB round trip
-        //   8. Save the BidRecord with bidRecordRepository.save(record) and return
-        //      Optional.of(new BidResponse(...)) or Optional.empty()
-        //
-        // Example: Use geolocation to enrich targeting
-        // if (request.ipAddress() != null) {
-        //     return geolocationService.getCountryCode(request.ipAddress())
-        //         .flatMap(countryCode -> {
-        //             // Use countryCode for geo-targeting logic
-        //             return processBidWithGeo(request, countryCode);
-        //         })
-        //         .switchIfEmpty(processBidWithGeo(request, null));
-        // }
-
         metrics.recordRequest();
         BidRecord record = buildRecord(request);
 
@@ -130,28 +114,19 @@ public class BiddingService {
                 .collectList()
                 .flatMap(cachedCreatives -> {
                     if (cachedCreatives.isEmpty()) {
-                        record.setNoBidReason("no_eligible_creative");
-                        record.setLatencyMs((int) ((System.nanoTime() - start) / 1_000_000));
-                        metrics.recordNoBid("no_eligible_creative");
-                        metrics.recordLatency(record.getLatencyMs());
-                        return bidRecordRepository.save(record).thenReturn(Optional.empty());
+                        return noBid(record, start, "no_eligible_creative");
                     }
 
-                    // F3: Filter creatives by max bid price (checked BEFORE targeting and budget)
+                    // F3: max bid price check BEFORE targeting and budget
                     List<CachedCreative> affordableCreatives = cachedCreatives.stream()
                             .filter(c -> c.isWithinMaxBid(request.floorPrice()))
                             .toList();
 
                     if (affordableCreatives.isEmpty()) {
-                        record.setNoBidReason("floor_exceeds_max_bid");
-                        record.setLatencyMs((int) ((System.nanoTime() - start) / 1_000_000));
-                        metrics.recordNoBid("floor_exceeds_max_bid");
-                        metrics.recordLatency(record.getLatencyMs());
-                        return bidRecordRepository.save(record).thenReturn(Optional.empty());
+                        return noBid(record, start, "floor_exceeds_max_bid");
                     }
 
-                    // F1: Filter creatives by audience targeting (geo, device, audience_segment)
-                    // Try strict matching first (all three dimensions)
+                    // F1: audience targeting (all three dimensions must pass)
                     List<CachedCreative> strictMatches = affordableCreatives.stream()
                             .filter(c -> c.matches(
                                     request.targeting().geo(),
@@ -159,8 +134,6 @@ public class BiddingService {
                                     request.targeting().audienceSegment()))
                             .toList();
 
-                    // Fallback: if no strict matches, relax audience_segment requirement
-                    // (geo and device still must match - they're critical for format/region)
                     final List<CachedCreative> matchingCreatives;
                     if (strictMatches.isEmpty()) {
                         List<CachedCreative> fallbackMatches = affordableCreatives.stream()
@@ -168,27 +141,16 @@ public class BiddingService {
                                         request.targeting().geo(),
                                         request.targeting().deviceType()))
                                 .toList();
-
-                        if (!fallbackMatches.isEmpty()) {
-                            log.debug("Fallback to geo+device match (ignoring audience_segment) for request {}",
-                                    request.requestId());
-                            matchingCreatives = fallbackMatches;
-                        } else {
-                            matchingCreatives = List.of();
-                        }
+                        matchingCreatives = fallbackMatches.isEmpty() ? List.of() : fallbackMatches;
                     } else {
                         matchingCreatives = strictMatches;
                     }
 
                     if (matchingCreatives.isEmpty()) {
-                        record.setNoBidReason("targeting_miss");
-                        record.setLatencyMs((int) ((System.nanoTime() - start) / 1_000_000));
-                        metrics.recordNoBid("targeting_miss");
-                        metrics.recordLatency(record.getLatencyMs());
-                        return bidRecordRepository.save(record).thenReturn(Optional.empty());
+                        return noBid(record, start, "targeting_miss");
                     }
 
-                    // F2: Filter creatives by budget (must have remaining budget > 0) - batch fetch with MGET
+                    // F2: budget check via Redis MGET (single round-trip)
                     List<String> creativeIds = matchingCreatives.stream()
                             .map(c -> c.id())
                             .toList();
@@ -200,31 +162,26 @@ public class BiddingService {
                                         .toList();
 
                                 if (eligibleCreatives.isEmpty()) {
-                                    record.setNoBidReason("budget_exhausted");
-                                    record.setLatencyMs((int) ((System.nanoTime() - start) / 1_000_000));
-                                    metrics.recordNoBid("budget_exhausted");
-                                    metrics.recordLatency(record.getLatencyMs());
-                                    return bidRecordRepository.save(record).thenReturn(Optional.empty());
+                                    return noBid(record, start, "budget_exhausted");
                                 }
 
-                                // Budget-weighted selection: creatives with more remaining budget
-                                // have higher probability of being selected, naturally balancing
-                                // usage across the portfolio without sacrificing performance
+                                // Pacing: probabilistically skip bids to spread budget over duration
+                                double totalRemaining = budgetMap.values().stream()
+                                        .filter(b -> b > 0).mapToDouble(Double::doubleValue).sum();
+                                if (!shouldBid(totalRemaining)) {
+                                    return noBid(record, start, "pacing");
+                                }
+
                                 CachedCreative selectedCached = selectCreativeByBudgetWeight(
                                         eligibleCreatives,
                                         budgetMap,
                                         properties.getStrategy().isWeightedSelectionEnabled()
                                 );
 
-                                double computedBidPrice = computeBidPrice(request);
+                                double bidPrice = computeBidPrice(request);
 
-                                // Cap bid at creative's maxBidPrice (if set)
-                                final double bidPrice;
-                                if (selectedCached.maxBidPrice() != null && computedBidPrice > selectedCached.maxBidPrice()) {
+                                if (selectedCached.maxBidPrice() != null && bidPrice > selectedCached.maxBidPrice()) {
                                     bidPrice = selectedCached.maxBidPrice();
-                                    log.debug("Capped bid to creative maxBidPrice: {}", bidPrice);
-                                } else {
-                                    bidPrice = computedBidPrice;
                                 }
 
                                 record.setCreativeId(selectedCached.id());
@@ -236,53 +193,116 @@ public class BiddingService {
 
                                 metrics.recordLatency(record.getLatencyMs());
 
-                                // Fetch full Creative from DB for response fields (name, imageUrl, etc)
-                                return creativeCache.getAll()
-                                        .filter(c -> c.getId().equals(selectedCached.id()))
-                                        .next()
-                                        .flatMap(fullCreative -> {
-                                            BidResponse response = new BidResponse(
-                                                    request.requestId(),
-                                                    bidPrice,
-                                                    toCreativeDto(fullCreative)
-                                            );
-                                            return bidRecordRepository.save(record).thenReturn(Optional.of(response));
-                                        })
-                                        .switchIfEmpty(Mono.defer(() -> {
-                                            log.warn("Creative {} not found in DB after cache lookup", selectedCached.id());
-                                            record.setNoBidReason("creative_not_found");
-                                            metrics.recordNoBid("creative_not_found");
-                                            return bidRecordRepository.save(record).thenReturn(Optional.empty());
-                                        }));
+                                // Build response from in-memory DTO cache (no DB round-trip)
+                                CreativeDto dto = creativeDtoCache.get(selectedCached.id());
+                                if (dto == null) {
+                                    dto = new CreativeDto(
+                                            selectedCached.id(), selectedCached.id(), "", "", "",
+                                            splitCsv(selectedCached.allowedGeos()),
+                                            splitCsv(selectedCached.allowedDevices()),
+                                            splitCsv(selectedCached.audienceSegments())
+                                    );
+                                }
+
+                                BidResponse response = new BidResponse(
+                                        request.requestId(), bidPrice, dto);
+
+                                // Fire-and-forget: don't block response on DB write
+                                bidRecordRepository.save(record).subscribe();
+
+                                return Mono.just(Optional.<BidResponse>of(response));
                             });
                 });
     }
 
-    private double computeBidPrice(BidRequest request) {
-        // Static fallback if adaptive disabled
-        if (!properties.getAdaptiveStrategy().isEnabled()) {
-            return request.floorPrice() * 1.01;
+    private Mono<Optional<BidResponse>> noBid(BidRecord record, long startNanos, String reason) {
+        record.setNoBidReason(reason);
+        record.setLatencyMs((int) ((System.nanoTime() - startNanos) / 1_000_000));
+        metrics.recordNoBid(reason);
+        metrics.recordLatency(record.getLatencyMs());
+        bidRecordRepository.save(record).subscribe();
+        return Mono.just(Optional.empty());
+    }
+
+    /**
+     * Pacing gate: probabilistically skip bids to spread budget evenly over competition duration.
+     * All in-memory, <0.01ms — no I/O.
+     */
+    private boolean shouldBid(double remainingBudget) {
+        long durationSeconds = properties.getCompetition().getDurationSeconds();
+        if (durationSeconds <= 0) {
+            return true;
         }
 
-        // Adaptive weight-based pricing (100ms SLA: pure in-memory, <0.01ms)
+        if (firstBidTime == null) {
+            firstBidTime = Instant.now();
+            initialBudget = remainingBudget;
+        }
+
+        if (initialBudget <= 0) {
+            return true;
+        }
+
+        double elapsed = Duration.between(firstBidTime, Instant.now()).toMillis() / 1000.0;
+        double fractionTimeElapsed = Math.min(1.0, elapsed / durationSeconds);
+        double fractionBudgetRemaining = remainingBudget / initialBudget;
+
+        // Target: budget remaining should roughly equal time remaining
+        // If we've used more budget than time elapsed, throttle
+        double targetBudgetRemaining = 1.0 - fractionTimeElapsed;
+        double pace = fractionBudgetRemaining / Math.max(0.01, targetBudgetRemaining);
+
+        // pace > 1 = ahead of schedule (have budget to spare), always bid
+        // pace < 1 = behind schedule (spending too fast), probabilistically skip
+        if (pace >= 1.0) {
+            return true;
+        }
+
+        // Probability of bidding = pace^2 (quadratic throttle: aggressive when overspending)
+        return random.nextDouble() < (pace * pace);
+    }
+
+    /**
+     * Warm the creative DTO cache on first use (called lazily).
+     * Populates display fields so bid() never needs a DB round-trip.
+     */
+    public void warmCreativeDtoCache() {
+        creativeCache.getAll()
+                .doOnNext(c -> creativeDtoCache.put(c.getId(), toCreativeDto(c)))
+                .subscribe();
+    }
+
+    private double computeBidPrice(BidRequest request) {
+        double floor = request.floorPrice();
+
+        if (!properties.getAdaptiveStrategy().isEnabled()) {
+            return floor * 1.01;
+        }
+
         BidSegment segment = BidSegment.from(request);
         AdaptiveWeights weights = weightsCache.getWeightsSync(segment);
 
-        double floor = request.floorPrice();
-        double market = Math.max(statsCache.getRollingAverageWinPrice(), floor);
+        double market = statsCache.getRollingAverageWinPrice();
 
-        // Random exploration with gaussian noise (prevents local optima)
+        // If no market data yet, bid conservatively just above floor
+        if (market <= floor) {
+            return floor * 1.005;
+        }
+
+        // Bid between floor and market — never above market price
         double randomFactor = 1.0 + random.nextGaussian() *
             properties.getAdaptiveStrategy().getExplorationNoise();
-        double randomComponent = floor * Math.max(0.95, Math.min(1.05, randomFactor));
+        double randomComponent = floor * Math.max(0.98, Math.min(1.02, randomFactor));
 
-        // Weighted combination
         double bid = weights.floorWeight() * floor +
-                     weights.marketWeight() * market +
+                     weights.marketWeight() * Math.min(market, floor * 1.3) +
                      weights.randomWeight() * randomComponent;
 
-        // Safety: never below floor * 1.001 (must beat floor price)
-        return Math.max(floor * 1.001, bid);
+        // Never below floor * 1.001, never above market (avoid overpaying)
+        bid = Math.max(floor * 1.001, bid);
+        bid = Math.min(bid, market);
+
+        return bid;
     }
 
     /** Total remaining budget across all this bidder's creatives. */

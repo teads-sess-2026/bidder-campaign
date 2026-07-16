@@ -37,3 +37,5 @@ config.prod.env
 config.env
 *.env
 !*.env.example
+
+results/
