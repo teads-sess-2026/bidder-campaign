@@ -49,7 +49,11 @@ public record CachedCreative(
     }
 
     private boolean matchesField(String allowed, String value) {
+        // Creative accepts any value (no restriction)
         if (allowed == null || allowed.isBlank()) return true;
+        // Request has no targeting value (wildcard - matches any creative)
+        if (value == null || value.isBlank()) return true;
+        // Check if request value matches one of creative's allowed values
         for (String entry : allowed.split(",")) {
             if (entry.trim().equalsIgnoreCase(value)) return true;
         }

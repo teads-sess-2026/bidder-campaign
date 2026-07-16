@@ -42,9 +42,13 @@ public class BidderProperties {
         private double premiumMultiplier = 1.5;
         private double pacingBoost = 1.20;
         private double pacingCut = 0.85;
+        private boolean weightedSelectionEnabled = true;
 
         public int getMinSamples() { return minSamples; }
         public void setMinSamples(int minSamples) { this.minSamples = minSamples; }
+
+        public boolean isWeightedSelectionEnabled() { return weightedSelectionEnabled; }
+        public void setWeightedSelectionEnabled(boolean weightedSelectionEnabled) { this.weightedSelectionEnabled = weightedSelectionEnabled; }
 
         public double getColdStartMultiplier() { return coldStartMultiplier; }
         public void setColdStartMultiplier(double coldStartMultiplier) { this.coldStartMultiplier = coldStartMultiplier; }

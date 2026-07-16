@@ -172,10 +172,11 @@ public class BiddingService {
                             .toList();
 
                     return statsCache.getRemainingBudgets(creativeIds)
-                            .map(budgetMap -> matchingCreatives.stream()
-                                    .filter(c -> budgetMap.getOrDefault(c.id(), 0.0) > 0)
-                                    .toList())
-                            .flatMap(eligibleCreatives -> {
+                            .flatMap(budgetMap -> {
+                                List<CachedCreative> eligibleCreatives = matchingCreatives.stream()
+                                        .filter(c -> budgetMap.getOrDefault(c.id(), 0.0) > 0)
+                                        .toList();
+
                                 if (eligibleCreatives.isEmpty()) {
                                     record.setNoBidReason("budget_exhausted");
                                     record.setLatencyMs((int) ((System.nanoTime() - start) / 1_000_000));
@@ -184,8 +185,14 @@ public class BiddingService {
                                     return bidRecordRepository.save(record).thenReturn(Optional.empty());
                                 }
 
-                                // Select random creative from eligible ones
-                                CachedCreative selectedCached = eligibleCreatives.get(random.nextInt(eligibleCreatives.size()));
+                                // Budget-weighted selection: creatives with more remaining budget
+                                // have higher probability of being selected, naturally balancing
+                                // usage across the portfolio without sacrificing performance
+                                CachedCreative selectedCached = selectCreativeByBudgetWeight(
+                                        eligibleCreatives,
+                                        budgetMap,
+                                        properties.getStrategy().isWeightedSelectionEnabled()
+                                );
 
                                 double computedBidPrice = computeBidPrice(request);
 
@@ -315,5 +322,50 @@ public class BiddingService {
             record.setAudienceSegment(request.targeting().audienceSegment());
         }
         return record;
+    }
+
+    /**
+     * Select a creative from eligible list using budget-weighted random selection.
+     * Creatives with more remaining budget have higher probability of selection,
+     * naturally balancing spend across the portfolio.
+     *
+     * @param eligibleCreatives List of creatives that passed all filters
+     * @param budgetMap Map of creative ID to remaining budget
+     * @param useWeightedSelection If false, falls back to uniform random selection
+     * @return Selected creative
+     */
+    private CachedCreative selectCreativeByBudgetWeight(
+            List<CachedCreative> eligibleCreatives,
+            java.util.Map<String, Double> budgetMap,
+            boolean useWeightedSelection) {
+
+        if (!useWeightedSelection || eligibleCreatives.size() == 1) {
+            return eligibleCreatives.get(random.nextInt(eligibleCreatives.size()));
+        }
+
+        // Calculate total budget across all eligible creatives
+        double totalBudget = 0.0;
+        for (CachedCreative creative : eligibleCreatives) {
+            totalBudget += budgetMap.getOrDefault(creative.id(), 0.0);
+        }
+
+        // Edge case: all budgets are 0 (shouldn't happen as we filter these out)
+        if (totalBudget <= 0.0) {
+            return eligibleCreatives.get(random.nextInt(eligibleCreatives.size()));
+        }
+
+        // Weighted random selection using roulette wheel algorithm
+        double randomValue = random.nextDouble() * totalBudget;
+        double cumulativeWeight = 0.0;
+
+        for (CachedCreative creative : eligibleCreatives) {
+            cumulativeWeight += budgetMap.getOrDefault(creative.id(), 0.0);
+            if (randomValue <= cumulativeWeight) {
+                return creative;
+            }
+        }
+
+        // Fallback (rounding edge case)
+        return eligibleCreatives.get(eligibleCreatives.size() - 1);
     }
 }
