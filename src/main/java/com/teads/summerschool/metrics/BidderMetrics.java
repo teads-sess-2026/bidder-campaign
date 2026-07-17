@@ -23,6 +23,8 @@ public class BidderMetrics {
     private final Counter wins;
     private final Counter losses;
     private final Counter spend;
+    private final Counter bidPriceTotal;
+    private final Counter pacingSkips;
     private final Timer bidLatency;
     public final Counter summerschool_bids;
 
@@ -45,6 +47,10 @@ public class BidderMetrics {
                 .description("Auctions lost after bidding").register(registry);
         this.spend = Counter.builder(prefix + "spend")
                 .description("Total clearing price paid").register(registry);
+        this.bidPriceTotal = Counter.builder(prefix + "bid.price.total")
+                .description("Sum of all bid prices submitted").register(registry);
+        this.pacingSkips = Counter.builder(prefix + "pacing.skips")
+                .description("Bids skipped by pacing").register(registry);
         this.bidLatency = Timer.builder(prefix + "bid.latency")
                 .description("Bid handling latency").register(registry);
         this.summerschool_bids = Counter.builder(prefix + "Summerschool bids")
@@ -67,6 +73,10 @@ public class BidderMetrics {
     }
 
     public void recordLoss() { losses.increment(); }
+
+    public void recordBidPrice(double price) { bidPriceTotal.increment(price); }
+
+    public void recordPacingSkip() { pacingSkips.increment(); }
 
     /** Register a live gauge (e.g. remaining budget); the group prefix is applied. */
     public void registerGauge(String name, Supplier<Number> supplier) {

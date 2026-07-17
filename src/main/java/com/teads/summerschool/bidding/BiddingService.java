@@ -154,6 +154,7 @@ public class BiddingService {
                             .mapToDouble(c -> budgetMap.getOrDefault(c.id(), properties.getCreativeBudget()))
                             .sum();
                     if (!shouldBid(totalRemaining)) {
+                        metrics.recordPacingSkip();
                         return noBid(record, start, "pacing");
                     }
 
@@ -169,6 +170,7 @@ public class BiddingService {
                     record.setCreativeId(selectedCached.id());
                     record.setBidPrice(bidPrice);
                     record.setLatencyMs((int) ((System.nanoTime() - start) / 1_000_000));
+                    metrics.recordBidPrice(bidPrice);
 
                     ownBidCache.record(request.requestId(), selectedCached.id(), bidPrice,
                                        BidSegment.from(request));
