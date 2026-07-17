@@ -5,13 +5,17 @@ import com.teads.summerschool.creative.CreativeRepository;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.data.redis.core.ReactiveRedisTemplate;
+import org.springframework.scheduling.annotation.Scheduled;
 import org.springframework.stereotype.Component;
 import reactor.core.publisher.Mono;
 
 import java.util.ArrayDeque;
 import java.util.Deque;
 import java.util.List;
+import java.util.Map;
+import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.atomic.AtomicLong;
+import java.util.concurrent.atomic.AtomicReference;
 
 /**
  * Per-creative budget cache backed by Redis.
@@ -34,11 +38,45 @@ public class BidderStatsCache {
     private final AtomicLong winCount = new AtomicLong(0);
     private final Deque<Double> recentWinPrices = new ArrayDeque<>();
 
+    private final AtomicReference<Map<String, Double>> cachedBudgets = new AtomicReference<>(Map.of());
+
     public BidderStatsCache(BidderProperties properties, ReactiveRedisTemplate<String, String> redis,
-                             CreativeRepository creativeRepository) {
+                            CreativeRepository creativeRepository) {
         this.properties = properties;
         this.redis = redis;
         this.creativeRepository = creativeRepository;
+    }
+
+    @Scheduled(fixedRate = 1000)
+    public void refreshBudgets() {
+        double defaultBudget = properties.getCreativeBudget();
+        creativeRepository.findByBidderId(properties.getId())
+                .map(c -> c.getId())
+                .collectList()
+                .flatMap(ids -> {
+                    if (ids.isEmpty()) return Mono.just(Map.<String, Double>of());
+                    List<String> keys = ids.stream().map(this::budgetKey).toList();
+                    return redis.opsForValue().multiGet(keys).map(values -> {
+                        Map<String, Double> map = new ConcurrentHashMap<>();
+                        for (int i = 0; i < ids.size(); i++) {
+                            String val = values != null && i < values.size() ? values.get(i) : null;
+                            double budget = defaultBudget;
+                            if (val != null) {
+                                try { budget = Double.parseDouble(val); } catch (NumberFormatException ignored) {}
+                            }
+                            map.put(ids.get(i), budget);
+                        }
+                        return map;
+                    });
+                })
+                .doOnNext(cachedBudgets::set)
+                .doOnError(e -> log.warn("Budget refresh failed: {}", e.getMessage()))
+                .onErrorResume(e -> Mono.empty())
+                .subscribe();
+    }
+
+    public Map<String, Double> getCachedBudgets() {
+        return cachedBudgets.get();
     }
 
     /** Redis key holding the remaining budget for one creative. */

@@ -138,65 +138,61 @@ public class BiddingService {
                         return noBid(record, start, "targeting_miss");
                     }
 
-                    // F2: budget check via Redis MGET (single round-trip)
-                    List<String> creativeIds = matchingCreatives.stream()
-                            .map(c -> c.id())
+                    // F2: budget check from in-memory cache (refreshed every 1s, no Redis in hot path)
+                    Map<String, Double> budgetMap = statsCache.getCachedBudgets();
+
+                    List<CachedCreative> eligibleCreatives = matchingCreatives.stream()
+                            .filter(c -> budgetMap.getOrDefault(c.id(), properties.getCreativeBudget()) > 0)
                             .toList();
 
-                    return statsCache.getRemainingBudgets(creativeIds)
-                            .flatMap(budgetMap -> {
-                                List<CachedCreative> eligibleCreatives = matchingCreatives.stream()
-                                        .filter(c -> budgetMap.getOrDefault(c.id(), 0.0) > 0)
-                                        .toList();
+                    if (eligibleCreatives.isEmpty()) {
+                        return noBid(record, start, "budget_exhausted");
+                    }
 
-                                if (eligibleCreatives.isEmpty()) {
-                                    return noBid(record, start, "budget_exhausted");
-                                }
+                    // Pacing: probabilistically skip bids to spread budget over duration
+                    double totalRemaining = eligibleCreatives.stream()
+                            .mapToDouble(c -> budgetMap.getOrDefault(c.id(), properties.getCreativeBudget()))
+                            .sum();
+                    if (!shouldBid(totalRemaining)) {
+                        return noBid(record, start, "pacing");
+                    }
 
-                                // Pacing: probabilistically skip bids to spread budget over duration
-                                double totalRemaining = budgetMap.values().stream()
-                                        .filter(b -> b > 0).mapToDouble(Double::doubleValue).sum();
-                                if (!shouldBid(totalRemaining)) {
-                                    return noBid(record, start, "pacing");
-                                }
+                    CachedCreative selectedCached = selectCreativeBySpecificityAndBudget(
+                            eligibleCreatives, budgetMap);
 
-                                CachedCreative selectedCached = selectCreativeBySpecificityAndBudget(
-                                        eligibleCreatives, budgetMap);
+                    double bidPrice = computeBidPrice(request);
 
-                                double bidPrice = computeBidPrice(request);
+                    if (selectedCached.maxBidPrice() != null && bidPrice > selectedCached.maxBidPrice()) {
+                        bidPrice = selectedCached.maxBidPrice();
+                    }
 
-                                if (selectedCached.maxBidPrice() != null && bidPrice > selectedCached.maxBidPrice()) {
-                                    bidPrice = selectedCached.maxBidPrice();
-                                }
+                    record.setCreativeId(selectedCached.id());
+                    record.setBidPrice(bidPrice);
+                    record.setLatencyMs((int) ((System.nanoTime() - start) / 1_000_000));
 
-                                record.setCreativeId(selectedCached.id());
-                                record.setBidPrice(bidPrice);
-                                record.setLatencyMs((int) ((System.nanoTime() - start) / 1_000_000));
+                    ownBidCache.record(request.requestId(), selectedCached.id(), bidPrice,
+                                       BidSegment.from(request));
 
-                                ownBidCache.record(request.requestId(), selectedCached.id(), bidPrice,
-                                                   BidSegment.from(request));
+                    metrics.recordLatency(record.getLatencyMs());
 
-                                metrics.recordLatency(record.getLatencyMs());
+                    // Build response from in-memory DTO cache (no DB round-trip)
+                    CreativeDto dto = creativeDtoCache.get(selectedCached.id());
+                    if (dto == null) {
+                        dto = new CreativeDto(
+                                selectedCached.id(), selectedCached.id(), "", "", "",
+                                splitCsv(selectedCached.allowedGeos()),
+                                splitCsv(selectedCached.allowedDevices()),
+                                splitCsv(selectedCached.audienceSegments())
+                        );
+                    }
 
-                                // Build response from in-memory DTO cache (no DB round-trip)
-                                CreativeDto dto = creativeDtoCache.get(selectedCached.id());
-                                if (dto == null) {
-                                    dto = new CreativeDto(
-                                            selectedCached.id(), selectedCached.id(), "", "", "",
-                                            splitCsv(selectedCached.allowedGeos()),
-                                            splitCsv(selectedCached.allowedDevices()),
-                                            splitCsv(selectedCached.audienceSegments())
-                                    );
-                                }
+                    BidResponse response = new BidResponse(
+                            request.requestId(), bidPrice, dto);
 
-                                BidResponse response = new BidResponse(
-                                        request.requestId(), bidPrice, dto);
+                    // Fire-and-forget: don't block response on DB write
+                    bidRecordRepository.save(record).subscribe();
 
-                                // Fire-and-forget: don't block response on DB write
-                                bidRecordRepository.save(record).subscribe();
-
-                                return Mono.just(Optional.<BidResponse>of(response));
-                            });
+                    return Mono.just(Optional.<BidResponse>of(response));
                 });
     }
 
